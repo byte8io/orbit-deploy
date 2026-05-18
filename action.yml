@@ -85,32 +85,72 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Installing orbit-agent (${AGENT_VERSION})"
-        # get.byte8.io/install.sh is the canonical installer used by
-        # customers on real hosts. Same script works on a GitHub-hosted
-        # runner: detects platform, downloads the matching binary, drops
-        # it into ~/.local/bin (already on PATH for ubuntu-latest).
+
+        # Resolve tag. byte8io/orbit-agent release tags are prefixed
+        # `orbit-v<semver>` (e.g. `orbit-v0.6.15`); accept any of
+        # `latest`, `0.6.15`, `v0.6.15`, `orbit-v0.6.15` for ergonomics.
         if [ "${AGENT_VERSION}" = "latest" ]; then
-          curl -fsSL https://get.byte8.io/install.sh | sh
-        else
-          curl -fsSL https://get.byte8.io/install.sh | ORBIT_AGENT_VERSION="${AGENT_VERSION}" sh
-        fi
-        # Belt-and-suspenders: install.sh writes to ~/.local/bin which
-        # is on PATH for ubuntu-latest but adding it to GITHUB_PATH
-        # makes the binary discoverable for subsequent steps too.
-        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
-        # Sanity check — fail early with a clear message if install
-        # didn't land what we expected.
-        if ! command -v orbit-agent >/dev/null 2>&1; then
-          if [ -x "${HOME}/.local/bin/orbit-agent" ]; then
-            echo "${HOME}/.local/bin/orbit-agent --version:"
-            "${HOME}/.local/bin/orbit-agent" --version
-          else
-            echo "::error::orbit-agent not found after install. Check the install log above."
+          TAG=$(curl -fsSL "https://api.github.com/repos/byte8io/orbit-agent/releases/latest" \
+                | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+          if [ -z "${TAG}" ]; then
+            echo "::error::Could not resolve latest tag from byte8io/orbit-agent. Is the repo public?"
             exit 1
           fi
         else
-          orbit-agent --version
+          TAG="${AGENT_VERSION}"
+          case "${TAG}" in
+            orbit-v*) ;;
+            v*) TAG="orbit-${TAG}" ;;
+            *) TAG="orbit-v${TAG}" ;;
+          esac
         fi
+        echo "Resolved tag: ${TAG}"
+
+        # Detect target triple. GH-hosted runners default to
+        # ubuntu-latest (x86_64) but ARM64 runners are increasingly
+        # common — match what's published on byte8io/orbit-agent.
+        case "$(uname -s)" in
+          Linux) OS="unknown-linux-gnu" ;;
+          *)
+            echo "::error::Unsupported OS $(uname -s). Only Linux runners are supported today."
+            exit 1
+            ;;
+        esac
+        case "$(uname -m)" in
+          x86_64|amd64) ARCH="x86_64" ;;
+          aarch64|arm64) ARCH="aarch64" ;;
+          *)
+            echo "::error::Unsupported arch $(uname -m). Expected x86_64 or aarch64."
+            exit 1
+            ;;
+        esac
+        TRIPLE="${ARCH}-${OS}"
+        ASSET="orbit-agent-${TRIPLE}.tar.gz"
+        URL="https://github.com/byte8io/orbit-agent/releases/download/${TAG}/${ASSET}"
+        echo "Downloading ${URL}"
+
+        # Download tarball + checksum. --retry 3 papers over transient
+        # network blips; -fsSL fails cleanly on non-2xx (no scraping of
+        # an HTML error page into the tarball path).
+        TMP=$(mktemp -d)
+        trap "rm -rf '${TMP}'" EXIT
+        curl -fsSL --retry 3 "${URL}" -o "${TMP}/${ASSET}"
+        curl -fsSL --retry 3 "${URL}.sha256" -o "${TMP}/${ASSET}.sha256"
+
+        # Verify. The .sha256 file is in the standard
+        # `<hex>  <filename>` shape that `sha256sum -c -` accepts.
+        (cd "${TMP}" && sha256sum -c "${ASSET}.sha256")
+
+        # Install. The tarball contains just the `orbit-agent` binary
+        # at root. ~/.local/bin is on PATH for ubuntu-latest by default
+        # but we also write it to GITHUB_PATH so subsequent action
+        # steps inherit it.
+        mkdir -p "${HOME}/.local/bin"
+        tar -xzf "${TMP}/${ASSET}" -C "${HOME}/.local/bin"
+        chmod +x "${HOME}/.local/bin/orbit-agent"
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+        "${HOME}/.local/bin/orbit-agent" --version
         echo "::endgroup::"
 
     - name: Run build-and-upload
