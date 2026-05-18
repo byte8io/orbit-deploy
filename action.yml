@@ -1,0 +1,165 @@
+name: 'Orbit Deploy'
+description: 'Build, upload, and deploy a Magento artifact via Orbit (byte8.io)'
+author: 'Byte8'
+branding:
+  icon: 'upload-cloud'
+  color: 'orange'
+
+inputs:
+  env-id:
+    description: 'Orbit environment UUID. Find it in the dashboard at orbit.byte8.io.'
+    required: true
+  pat:
+    description: 'Orbit Personal Access Token (starts with pat_). Mint one in dashboard Settings. Pass via ${{ secrets.ORBIT_PAT }}.'
+    required: true
+  source-dir:
+    description: 'Directory to tar up and ship as the artifact. Mutually exclusive with `archive`. The action runs `tar -czf <tmp> -C <source-dir> .` and ships the result.'
+    required: false
+  archive:
+    description: 'Path to a pre-built .tar.gz file (e.g. produced by an earlier job). Mutually exclusive with `source-dir`.'
+    required: false
+  exclude:
+    description: 'Newline-separated tar exclude patterns (e.g. `.git`, `node_modules`, `*.log`). Only meaningful with `source-dir`.'
+    required: false
+  git-ref:
+    description: 'Git ref recorded on the deployment row + REVISION file. Defaults to the GitHub commit SHA so the deploy is always traceable.'
+    required: false
+    default: ${{ github.sha }}
+  version:
+    description: 'Release directory name override. Auto-generated server-side (YYYYMMDD_HHMMSS UTC) when omitted.'
+    required: false
+  deploy-type:
+    description: 'Deploy type. `full` (default) or `code`. Artifact-mode envs always use the artifact path regardless — this only changes the cosmetic label.'
+    required: false
+    default: 'full'
+  watch:
+    description: 'Block until the deploy reaches a terminal state (completed / failed / cancelled). Job exit code matches the deploy outcome. Default `true` — the whole point of a CI step is to know whether it shipped.'
+    required: false
+    default: 'true'
+  watch-timeout-secs:
+    description: 'Hard cap on --watch before the job gives up (deploy keeps running on the agent). Default 1800 (30 minutes).'
+    required: false
+    default: '1800'
+  no-deploy:
+    description: 'Upload the artifact but skip createDeployment. Useful for pre-staging artifacts ahead of a manual dashboard click. Default `false`.'
+    required: false
+    default: 'false'
+  api-url:
+    description: 'Orbit GraphQL endpoint. Override only for self-hosted Orbit. Defaults to the production URL.'
+    required: false
+    default: 'https://orbit.byte8.io/graphql'
+  agent-version:
+    description: 'orbit-agent version to install (e.g. `v0.6.14`). Defaults to `latest` — pin to a specific tag if you want reproducible CI behaviour.'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${{ inputs.source-dir }}" ] && [ -z "${{ inputs.archive }}" ]; then
+          echo "::error::Must specify either 'source-dir' or 'archive'."
+          exit 1
+        fi
+        if [ -n "${{ inputs.source-dir }}" ] && [ -n "${{ inputs.archive }}" ]; then
+          echo "::error::'source-dir' and 'archive' are mutually exclusive — pick one."
+          exit 1
+        fi
+        case "${{ inputs.pat }}" in
+          pat_*) ;;
+          *)
+            echo "::error::Input 'pat' must be a Personal Access Token starting with pat_."
+            echo "::error::Agent tokens (obt_) authenticate the host-side polling agent, not CI."
+            echo "::error::Mint a PAT in Orbit dashboard Settings and pass it via secrets."
+            exit 1
+            ;;
+        esac
+
+    - name: Install orbit-agent
+      shell: bash
+      env:
+        AGENT_VERSION: ${{ inputs.agent-version }}
+      run: |
+        set -euo pipefail
+        echo "::group::Installing orbit-agent (${AGENT_VERSION})"
+        # get.byte8.io/install.sh is the canonical installer used by
+        # customers on real hosts. Same script works on a GitHub-hosted
+        # runner: detects platform, downloads the matching binary, drops
+        # it into ~/.local/bin (already on PATH for ubuntu-latest).
+        if [ "${AGENT_VERSION}" = "latest" ]; then
+          curl -fsSL https://get.byte8.io/install.sh | sh
+        else
+          curl -fsSL https://get.byte8.io/install.sh | ORBIT_AGENT_VERSION="${AGENT_VERSION}" sh
+        fi
+        # Belt-and-suspenders: install.sh writes to ~/.local/bin which
+        # is on PATH for ubuntu-latest but adding it to GITHUB_PATH
+        # makes the binary discoverable for subsequent steps too.
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+        # Sanity check — fail early with a clear message if install
+        # didn't land what we expected.
+        if ! command -v orbit-agent >/dev/null 2>&1; then
+          if [ -x "${HOME}/.local/bin/orbit-agent" ]; then
+            echo "${HOME}/.local/bin/orbit-agent --version:"
+            "${HOME}/.local/bin/orbit-agent" --version
+          else
+            echo "::error::orbit-agent not found after install. Check the install log above."
+            exit 1
+          fi
+        else
+          orbit-agent --version
+        fi
+        echo "::endgroup::"
+
+    - name: Run build-and-upload
+      shell: bash
+      env:
+        ORBIT_PAT: ${{ inputs.pat }}
+        ORBIT_ENV_ID: ${{ inputs.env-id }}
+        ORBIT_API_URL: ${{ inputs.api-url }}
+        SOURCE_DIR: ${{ inputs.source-dir }}
+        ARCHIVE: ${{ inputs.archive }}
+        EXCLUDES: ${{ inputs.exclude }}
+        GIT_REF: ${{ inputs.git-ref }}
+        VERSION: ${{ inputs.version }}
+        DEPLOY_TYPE: ${{ inputs.deploy-type }}
+        WATCH: ${{ inputs.watch }}
+        WATCH_TIMEOUT: ${{ inputs.watch-timeout-secs }}
+        NO_DEPLOY: ${{ inputs.no-deploy }}
+      run: |
+        set -euo pipefail
+        # Build the argv array in shell so quoting stays clean and we
+        # don't have to dance around YAML's space-separated string
+        # semantics. ORBIT_PAT / ORBIT_ENV_ID / ORBIT_API_URL come
+        # through env vars (clap's #[arg(env = ...)] picks them up)
+        # so they never appear in process listings.
+        ARGS=()
+        if [ -n "${SOURCE_DIR}" ]; then
+          ARGS+=(--source-dir "${SOURCE_DIR}")
+          if [ -n "${EXCLUDES}" ]; then
+            # Newline-separated patterns -> repeated --exclude flags.
+            while IFS= read -r pat; do
+              [ -z "${pat}" ] && continue
+              ARGS+=(--exclude "${pat}")
+            done <<< "${EXCLUDES}"
+          fi
+        fi
+        if [ -n "${ARCHIVE}" ]; then
+          ARGS+=(--archive "${ARCHIVE}")
+        fi
+        if [ -n "${GIT_REF}" ]; then
+          ARGS+=(--git-ref "${GIT_REF}")
+        fi
+        if [ -n "${VERSION}" ]; then
+          ARGS+=(--version "${VERSION}")
+        fi
+        ARGS+=(--deploy-type "${DEPLOY_TYPE}")
+        if [ "${NO_DEPLOY}" = "true" ]; then
+          ARGS+=(--no-deploy)
+        elif [ "${WATCH}" = "true" ]; then
+          ARGS+=(--watch --watch-timeout-secs "${WATCH_TIMEOUT}")
+        fi
+        echo "Running: orbit-agent build-and-upload ${ARGS[*]}"
+        orbit-agent build-and-upload "${ARGS[@]}"
