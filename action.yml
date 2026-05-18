@@ -10,7 +10,7 @@ inputs:
     description: 'Orbit environment UUID. Find it in the dashboard at orbit.byte8.io.'
     required: true
   pat:
-    description: 'Orbit Personal Access Token (starts with pat_). Mint one in dashboard Settings. Pass via ${{ secrets.ORBIT_PAT }}.'
+    description: 'Orbit Personal Access Token (starts with pat_). Mint one in dashboard Settings. Pass via your repo''s ORBIT_PAT secret.'
     required: true
   source-dir:
     description: 'Directory to tar up and ship as the artifact. Mutually exclusive with `archive`. The action runs `tar -czf <tmp> -C <source-dir> .` and ships the result.'
