@@ -1,4 +1,4 @@
-name: 'Orbit Deploy'
+name: 'Byte8 Orbit Deploy'
 description: 'Build, upload, and deploy a Magento artifact via Orbit (byte8.io)'
 author: 'Byte8'
 branding:
